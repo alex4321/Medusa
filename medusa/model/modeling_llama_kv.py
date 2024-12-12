@@ -114,7 +114,7 @@ class MedusaLlamaRotaryEmbedding(LlamaRotaryEmbedding):
                  scaling_factor=1.0,
                  rope_type="default",
                  config: Optional[LlamaConfig] = None):
-        super().__init__(dim, max_position_embeddings, base, device)
+        super().__init__(dim, max_position_embeddings, base, device, scaling_factor, rope_type, config)
 
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
@@ -224,18 +224,18 @@ class LlamaAttention(nn.Module):
                 base=self.rope_theta,
             )
         else:
-            scaling_type = self.config.rope_scaling.get(
+            rope_type = self.config.rope_scaling.get(
                 "rope_type",
                 self.config.rope_scaling.get("type")
             )
-            assert scaling_type is not None, "scaling type must be provided in the config"     
+            assert rope_type is not None, "rope type must be provided in the config"     
             scaling_factor = self.config.rope_scaling["factor"]
             self.rotary_emb = MedusaLlamaRotaryEmbedding(
                 self.head_dim,
                 max_position_embeddings=self.max_position_embeddings,
                 base=self.rope_theta,
                 scaling_factor=scaling_factor,
-                scaling_type=scaling_type,
+                rope_type=rope_type,
                 device=self.q_proj.weight.device,
                 config=self.config,
             )
