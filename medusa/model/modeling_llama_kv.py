@@ -121,6 +121,7 @@ class MedusaLlamaRotaryEmbedding(LlamaRotaryEmbedding):
         bs = x.shape[0]
         if seq_len is None:
             seq_len = x.size(2)
+        # TODO: return cos / sin caching itself
         position_ids = (torch.arange(bs * seq_len, dtype=torch.long, device=x.device) % seq_len) \
             .view(bs, seq_len)
         return super(MedusaLlamaRotaryEmbedding, self).forward(x, position_ids)
