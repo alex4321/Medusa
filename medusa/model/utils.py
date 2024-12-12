@@ -1,3 +1,4 @@
+from typing import Tuple, Literal
 import torch
 import torch.nn.functional as F
 
@@ -430,12 +431,146 @@ def get_typical_posterior_mask(logits, candidates, temperature, posterior_thresh
     sampled_tokens = sampled_tokens.view(n_samples, n_tokens)
     posterior_mask = (candidates[:, 1:] == sampled_tokens).int()
     return posterior_mask
+
+
+def _evaluate_posterior_overall(logits: torch.Tensor, candidates: torch.Tensor,
+                                temperature: float, posterior_threshold: float, posterior_alpha: float,) -> Tuple[int, int]:
+    """
+    Args:
+        logits: A tensor of shape (n_tree_leafs, medusa_heads, vocab_size) representing the predictions from the model.
+        candidates: A tensor of shape (n_tree_leafs, medusa_heads) containing the token IDs from medusa heads.
+
+    Returns:
+        Tuple containing:
+            - A tensor of shape (n_tree_leafs,) with self-perplexity values for each tree leaf.
+            - The index of the leaf with the lowest self-perplexity.
+    """
+    # Let's compute posterior mask from "typical" method
+    if temperature == 0:
+        temperature = 1.0
+    logits_scaled = logits / temperature
+    posterior_logprob = torch.log_softmax(logits_scaled[:, :-1], dim=-1) # (n_tree_leafs, medusa_heads, vocab_size)
+    posterior_prob = torch.softmax(logits_scaled[:, :-1], dim=-1)        # (n_tree_leafs, medusa_heads, vocab_size)
+    candidates_prob = torch.gather(                                      # (n_tree_leafs, medusa_heads)
+        posterior_prob, dim=-1, index=candidates[:, 1:].unsqueeze(-1)
+    ).squeeze(-1)
+    candidates_logprob = torch.gather(                                   # (n_tree_leafs, medusa_heads)
+        posterior_logprob, dim=-1, index=candidates[:, 1:].unsqueeze(-1)
+    ).squeeze(-1)
+    posterior_entropy = -torch.sum(                                      # (n_tree_leafs, medusa_heads)
+        posterior_prob * posterior_logprob,
+        dim=-1
+    )  # torch.sum(torch.log(*)) is faster than torch.prod
+    threshold = torch.minimum(                                           # (n_tree_leafs, medusa_heads)
+        torch.ones_like(posterior_entropy) * posterior_threshold,
+        torch.exp(-posterior_entropy) * posterior_alpha,
+    )
+    posterior_mask = candidates_prob > threshold                         # (n_tree_leafs, medusa_heads)
     
+    candidates_accept_mask = torch.cumprod(posterior_mask, dim=1)        # (n_tree_leafs, medusa_heads)
+    candidates_accept_length = candidates_accept_mask.sum(dim=1)         # (n_tree_leafs,)
+    
+    candidates_self_nll = F.cross_entropy(                               # (n_tree_leafs, medusa_heads)
+        logits_scaled[:, :-1].reshape([-1, logits_scaled.shape[-1]]),
+        candidates[:, 1:].reshape([-1]),
+        reduction='none'
+    ).reshape(candidates.shape[0], -1)
+    candidates_self_nll = (candidates_self_nll * candidates_accept_mask) \
+        .sum(dim=-1) / (candidates_accept_length + 1e-6)                 # (n_tree_leafs,)
+                                                                         # (n_tree_leafs,)
+    candidates_self_perplexity = \
+        (candidates_accept_length > 0) * torch.exp(candidates_self_nll) + \
+        (candidates_accept_length == 0) * 1000.0    
+    best_candidate = candidates_self_perplexity.argmin().item()
+    accept_length = candidates_accept_length[best_candidate].item()
+    return best_candidate, accept_length
+
+
+def _evaluate_posterior_greedy(logits: torch.Tensor, candidates: torch.Tensor) -> Tuple[int, int]:
+    # Find the tokens that match the maximum logits for each position in the sequence
+    posterior_mask = (
+        candidates[:, 1:] == torch.argmax(logits[:, :-1], dim=-1)
+    ).int()
+    candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
+    accept_length = candidates_accept_length.max()
+    # Choose the best candidate
+    if accept_length == 0:
+        # Default to the first candidate if none are accepted
+        best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
+    else:
+        best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
+    return best_candidate, accept_length
+
+
+def _evaluate_posterior_typical(logits: torch.Tensor, candidates: torch.Tensor, temperature: float,
+                                posterior_threshold: float, posterior_alpha: float,
+                                fast: bool = False) -> Tuple[int, int]:
+    if fast:
+        posterior_prob = torch.softmax(logits[:, :-1] / temperature, dim=-1)
+        candidates_prob = torch.gather(
+            posterior_prob, dim=-1, index=candidates[:, 1:].unsqueeze(-1)
+        ).squeeze(-1)
+        posterior_entropy = -torch.sum(
+            posterior_prob * torch.log(posterior_prob + 1e-5), dim=-1
+        )  # torch.sum(torch.log(*)) is faster than torch.prod
+        threshold = torch.minimum(
+            torch.ones_like(posterior_entropy) * posterior_threshold,
+            torch.exp(-posterior_entropy) * posterior_alpha,
+        )
+        posterior_mask = candidates_prob > threshold
+        candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
+
+        # Choose the best candidate based on the evaluated posterior probabilities
+        accept_length = candidates_accept_length.max()
+        if accept_length == 0:
+            # If no candidates are accepted, just choose the first one
+            best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
+        else:
+            best_candidates = torch.where(candidates_accept_length == accept_length)[0]
+            # Accept the best one according to likelihood
+            likelihood = torch.sum(
+                torch.log(candidates_prob[best_candidates, :accept_length]), dim=-1
+            )
+            best_candidate = best_candidates[torch.argmax(likelihood)]
+        return best_candidate, accept_length
+    # Calculate posterior probabilities and thresholds for candidate selection
+    posterior_mask = get_typical_posterior_mask(logits, candidates, temperature, posterior_threshold, posterior_alpha, fast)
+    candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
+    # Choose the best candidate based on the evaluated posterior probabilities
+    accept_length = candidates_accept_length.max()
+    
+    if accept_length == 0:
+        # If no candidates are accepted, just choose the first one
+        best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
+    else:
+        best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
+        # Accept the best one according to likelihood
+    return best_candidate, accept_length
+
+
+
+def _evaluate_posterior_nucleus(logits: torch.Tensor, candidates: torch.Tensor, temperature: float, top_p: float) \
+    -> Tuple[int, int]:
+    assert top_p < 1.0 + 1e-6, "top_p should between 0 and 1"
+    posterior_mask = get_nucleus_posterior_mask(logits, candidates, temperature, top_p)
+    candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
+    accept_length = candidates_accept_length.max()
+    # Choose the best candidate
+    if accept_length == 0:
+        # Default to the first candidate if none are accepted
+        best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
+    else:
+        best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
+    return best_candidate, accept_length
+
     
 
 def evaluate_posterior(
-    logits, candidates, temperature, posterior_threshold=0.3, posterior_alpha = 0.09, top_p=0.8, sampling = 'typical', fast = True
-):
+    logits: torch.Tensor, candidates: torch.Tensor,
+    temperature: float, posterior_threshold: float = 0.3, posterior_alpha: float = 0.09, top_p: float = 0.8,
+    sampling: Literal['typical', 'nucleus', 'overall'] = 'typical',
+    fast: bool = True
+) -> Tuple[int, int]:
     """
     Evaluate the posterior probabilities of the candidates based on the provided logits and choose the best candidate.
 
@@ -456,78 +591,17 @@ def evaluate_posterior(
     - accept_length (int): Length of the accepted candidate sequence.
     """
     # Greedy decoding based on temperature value
+    if (sampling == 'typical') and (temperature > 0):
+        return _evaluate_posterior_typical(logits, candidates, temperature, posterior_threshold, posterior_alpha, fast)
+    if (sampling == 'nucleus') and (temperature > 0):
+        return _evaluate_posterior_nucleus(logits, candidates, temperature, top_p)
+    if sampling == 'overall':
+        return _evaluate_posterior_overall(logits, candidates, temperature, posterior_threshold, posterior_alpha)
     if temperature == 0:
-        # Find the tokens that match the maximum logits for each position in the sequence
-        posterior_mask = (
-            candidates[:, 1:] == torch.argmax(logits[:, :-1], dim=-1)
-        ).int()
-        candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
-        accept_length = candidates_accept_length.max()
-        # Choose the best candidate
-        if accept_length == 0:
-            # Default to the first candidate if none are accepted
-            best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
-        else:
-            best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
-        return best_candidate, accept_length
-        
-    if sampling == 'typical':
-        if fast:
-            posterior_prob = torch.softmax(logits[:, :-1] / temperature, dim=-1)
-            candidates_prob = torch.gather(
-                posterior_prob, dim=-1, index=candidates[:, 1:].unsqueeze(-1)
-            ).squeeze(-1)
-            posterior_entropy = -torch.sum(
-                posterior_prob * torch.log(posterior_prob + 1e-5), dim=-1
-            )  # torch.sum(torch.log(*)) is faster than torch.prod
-            threshold = torch.minimum(
-                torch.ones_like(posterior_entropy) * posterior_threshold,
-                torch.exp(-posterior_entropy) * posterior_alpha,
-            )
-            posterior_mask = candidates_prob > threshold
-            candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
-
-            # Choose the best candidate based on the evaluated posterior probabilities
-            accept_length = candidates_accept_length.max()
-            if accept_length == 0:
-                # If no candidates are accepted, just choose the first one
-                best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
-            else:
-                best_candidates = torch.where(candidates_accept_length == accept_length)[0]
-                # Accept the best one according to likelihood
-                likelihood = torch.sum(
-                    torch.log(candidates_prob[best_candidates, :accept_length]), dim=-1
-                )
-                best_candidate = best_candidates[torch.argmax(likelihood)]
-            return best_candidate, accept_length
-        # Calculate posterior probabilities and thresholds for candidate selection
-        posterior_mask = get_typical_posterior_mask(logits, candidates, temperature, posterior_threshold, posterior_alpha, fast)
-        candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
-        # Choose the best candidate based on the evaluated posterior probabilities
-        accept_length = candidates_accept_length.max()
-        
-        if accept_length == 0:
-            # If no candidates are accepted, just choose the first one
-            best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
-        else:
-            best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
-            # Accept the best one according to likelihood
-        return best_candidate, accept_length
-    
-    if sampling == 'nucleus':
-        assert top_p < 1.0 + 1e-6, "top_p should between 0 and 1"
-        posterior_mask = get_nucleus_posterior_mask(logits, candidates, temperature, top_p)
-        candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
-        accept_length = candidates_accept_length.max()
-        # Choose the best candidate
-        if accept_length == 0:
-            # Default to the first candidate if none are accepted
-            best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
-        else:
-            best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
-        return best_candidate, accept_length
+        return _evaluate_posterior_greedy(logits, candidates)
     else:
         raise NotImplementedError
+
 def update_inference_inputs(
     input_ids,
     candidates,
