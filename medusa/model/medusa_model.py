@@ -1,7 +1,9 @@
+import functools
 import torch
 import torch.nn as nn
 from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
 from .modeling_mistral_kv import MistralForCausalLM as KVMistralForCausalLM
+from torch.utils.checkpoint import checkpoint
 # import transformers
 
 # # monkey patch
@@ -70,6 +72,37 @@ class ResBlock(nn.Module):
             torch.Tensor: Output after the residual connection and activation.
         """
         return x + self.act(self.linear(x))
+    
+    
+class CheckpointableSequential(nn.Sequential):
+    @functools.wraps(nn.Sequential.__init__)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gradient_checkpointing = False
+        self._gradient_checkpointing_func = None
+    
+    def forward(self, input):
+        if input.requires_grad and self.gradient_checkpointing:                
+            gradient_checkpointing_func = self._gradient_checkpointing_func
+            if not gradient_checkpointing_func:
+                gradient_checkpointing_func = checkpoint
+            return gradient_checkpointing_func(
+                lambda x: nn.Sequential.forward(self, x),
+                input
+            )
+        else:
+            return nn.Sequential.forward(self, input)
+    
+    
+def create_medusa_head(hidden_size, vocab_size, medusa_num_heads, medusa_num_layers):
+    heads = []
+    for i in range(medusa_num_heads):
+        residuals = []
+        for j in range(medusa_num_layers):
+            residuals.append(ResBlock(hidden_size))
+        head = CheckpointableSequential(*residuals, nn.Linear(hidden_size, vocab_size, bias=False))
+        heads.append(head)
+    return nn.ModuleList(heads)
 
 
 class MedusaModelABC(nn.Module):
@@ -108,15 +141,13 @@ class MedusaModelABC(nn.Module):
         self.base_model_name_or_path = base_model_name_or_path
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path)
         # Create a list of Medusa heads
-        self.medusa_head = nn.ModuleList(
-            [
-                nn.Sequential(
-                    *([ResBlock(self.hidden_size)] * medusa_num_layers),
-                    nn.Linear(self.hidden_size, self.vocab_size, bias=False),
-                )
-                for _ in range(medusa_num_heads)
-            ]
+        self.medusa_head = create_medusa_head(
+            self.hidden_size,
+            self.vocab_size,
+            medusa_num_heads,
+            medusa_num_layers,
         )
+        
     # Add a link named base_model to self
     @property
     def base_model(self):
